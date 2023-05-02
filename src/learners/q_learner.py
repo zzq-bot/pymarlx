@@ -3,7 +3,8 @@ from components.episode_buffer import EpisodeBatch
 from modules.mixers.vdn import VDNMixer
 from modules.mixers.qmix import QMixer
 import torch as th
-from torch.optim import RMSprop
+from torch.optim import RMSprop, Adam
+from components.standarize_stream import RunningMeanStd
 
 
 class QLearner:
@@ -27,12 +28,27 @@ class QLearner:
             self.params += list(self.mixer.parameters())
             self.target_mixer = copy.deepcopy(self.mixer)
 
-        self.optimiser = RMSprop(params=self.params, lr=args.lr, alpha=args.optim_alpha, eps=args.optim_eps)
+        match self.args.optim_type.lower():
+            case "rmsprop":
+                self.optimiser = RMSprop(params=self.params, lr=self.args.lr, alpha=self.args.optim_alpha, eps=self.args.optim_eps, weight_decay=self.args.weight_decay)
+            case "adam":
+                self.optimiser = Adam(params=self.params, lr=self.args.lr, weight_decay=self.args.weight_decay)
+            case _:
+                raise ValueError("Invalid optimiser type", self.args.optim_type)
 
         # a little wasteful to deepcopy (e.g. duplicates action selector), but should work for any MAC
         self.target_mac = copy.deepcopy(mac)
 
         self.log_stats_t = -self.args.learner_log_interval - 1
+        self.training_steps = 0
+        self.last_target_update_step = 0
+        self.last_target_update_episode = 0
+
+        device = "cuda" if args.use_cuda else "cpu"
+        if self.args.standardise_returns:
+            self.ret_ms = RunningMeanStd(shape=(self.n_agents,), device=device)
+        if self.args.standardise_rewards:
+            self.rew_ms = RunningMeanStd(shape=(1,), device=device)
 
     def train(self, batch: EpisodeBatch, t_env: int, episode_num: int):
         # Get the relevant quantities
@@ -42,6 +58,9 @@ class QLearner:
         mask = batch["filled"][:, :-1].float()
         mask[:, 1:] = mask[:, 1:] * (1 - terminated[:, :-1])
         avail_actions = batch["avail_actions"]
+        if self.args.standardise_rewards:
+            self.rew_ms.update(rewards)
+            rewards = (rewards - self.rew_ms.mean) / th.sqrt(self.rew_ms.var)
 
         # Calculate estimated Q-Values
         mac_out = []
@@ -81,10 +100,13 @@ class QLearner:
         if self.mixer is not None:
             chosen_action_qvals = self.mixer(chosen_action_qvals, batch["state"][:, :-1])
             target_max_qvals = self.target_mixer(target_max_qvals, batch["state"][:, 1:])
-
+        if self.args.standardise_returns:
+            target_max_qvals = target_max_qvals * th.sqrt(self.ret_ms.var) + self.ret_ms.mean
         # Calculate 1-step Q-Learning targets
         targets = rewards + self.args.gamma * (1 - terminated) * target_max_qvals
-
+        if self.args.standardise_returns:
+            self.ret_ms.update(targets)
+            targets = (targets - self.ret_ms.mean) / th.sqrt(self.ret_ms.var)
         # Td-error
         td_error = (chosen_action_qvals - targets.detach())
 
@@ -102,9 +124,12 @@ class QLearner:
         grad_norm = th.nn.utils.clip_grad_norm_(self.params, self.args.grad_norm_clip)
         self.optimiser.step()
 
-        if (episode_num - self.last_target_update_episode) / self.args.target_update_interval >= 1.0:
-            self._update_targets()
+        self.training_steps += 1
+        if self.args.target_update_interval_or_tau > 1 and (episode_num - self.last_target_update_episode) / self.args.target_update_interval_or_tau >= 1.0:
+            self._update_targets_hard()
             self.last_target_update_episode = episode_num
+        elif self.args.target_update_interval_or_tau <= 1.0:
+            self._update_targets_soft(self.args.target_update_interval_or_tau)
 
         if t_env - self.log_stats_t >= self.args.learner_log_interval:
             self.logger.log_stat("loss", loss.item(), t_env)
@@ -115,11 +140,17 @@ class QLearner:
             self.logger.log_stat("target_mean", (targets * mask).sum().item()/(mask_elems * self.args.n_agents), t_env)
             self.log_stats_t = t_env
 
-    def _update_targets(self):
+    def _update_targets_hard(self):
         self.target_mac.load_state(self.mac)
         if self.mixer is not None:
             self.target_mixer.load_state_dict(self.mixer.state_dict())
-        self.logger.console_logger.info("Updated target network")
+
+    def _update_targets_soft(self, tau):
+        for target_param, param in zip(self.target_mac.parameters(), self.mac.parameters()):
+            target_param.data.copy_(target_param.data * (1.0 - tau) + param.data * tau)
+        if self.mixer is not None:
+            for target_param, param in zip(self.target_mixer.parameters(), self.mixer.parameters()):
+                target_param.data.copy_(target_param.data * (1.0 - tau) + param.data * tau)
 
     def cuda(self):
         self.mac.cuda()
