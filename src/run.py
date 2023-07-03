@@ -201,15 +201,7 @@ def run_sequential(args, logger):
 
         if args.save_model and (runner.t_env - model_save_time >= args.save_model_interval or model_save_time == 0):
             model_save_time = runner.t_env
-            local_results_path = os.path.join(dirname(dirname(abspath(__file__))), "results") # default.yaml -> results by default
-            
-            match args.env:
-                case "sc2":
-                    save_path = os.path.join(local_results_path, args.env, args.env_args["map_name"], args.name, "models", args.unique_token, str(runner.t_env))
-                case "mpe":
-                    save_path = os.path.join(local_results_path, args.env, args.env_args["scenario_name"], args.name, "models", args.unique_token, str(runner.t_env))
-                case _:
-                    save_path = os.path.join(local_results_path, args.env, args.name, "models", args.unique_token, str(runner.t_env))
+            save_path = os.path.join(args.results_save_dir, "models", str(runner.t_env))
             
             # results/sc2/2s3z/qmix/models/unqiue_token/t_env
             os.makedirs(save_path, exist_ok=True)
